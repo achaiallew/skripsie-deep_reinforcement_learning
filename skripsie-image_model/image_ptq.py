@@ -1,3 +1,7 @@
+#============================================================================
+# Imports
+#============================================================================
+# Imports for Pytorh
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -6,8 +10,12 @@ import torch.nn.functional as F
 import gymnasium as gym
 from minigrid.wrappers import *
 
+# Imports for Post Training Quantization
 import copy
-from torchao.quantization import Int8DynamicActivationInt8WeightConfig, Int8WeightOnlyConfig, quantize_
+from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, Float8DynamicActivationInt4WeightConfig 
+from torchao.quantization import Float8StaticActivationFloat8WeightConfig, Float8WeightOnlyConfig, Int4WeightOnlyConfig  
+from torchao.quantization import Int8DynamicActivationInt8WeightConfig,  Int8DynamicActivationIntxWeightConfig 
+from torchao.quantization import Int8StaticActivationInt8WeightConfig, Int8WeightOnlyConfig, quantize_
 
 import image_dqn
 
@@ -16,11 +24,13 @@ from os.path import exists
 
 import time
 
+import numpy as np
+
 # =====================================================
 # Settings
 # =====================================================
 
-model_trained = "dqn_trained.pth"      # <-- change if necessary
+model_trained = "dqn_trained.pth"     
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- MODEL HYPERPARAMETERS ----
@@ -101,111 +111,115 @@ if exists(model_trained):
 else:
     raise FileNotFoundError(f'No saved model found at {model_trained}.')
 
-# Create a Copy to Quantize
-quantized_policy_net = copy.deepcopy(policy_net)
-wo_quantized_policy_net = copy.deepcopy(policy_net)
+# =====================================================
+# Post Training Quantization
+# =====================================================
+def quantize_models(pnet, config, config_name):
+    # Create a Copy to Quantize
+    quant_pnet = copy.deepcopy(pnet)
 
-# Quantize the Model - Weight Only
-quantize_(
-    wo_quantized_policy_net,
-    Int8WeightOnlyConfig()
-)
-# Quantize the Model - Dynamic Activations and Weights
-quantize_(
-    quantized_policy_net,
-    Int8DynamicActivationInt8WeightConfig()
-)
-
-# Evaluate All
-float_reward, float_rate, float_steps = image_dqn.eval_model(env, policy_net)
-quant_reward, quant_rate, quant_steps = image_dqn.eval_model(env, quantized_policy_net)
-wo_quant_reward, wo_quant_rate, wo_quant_steps = image_dqn.eval_model(env, wo_quantized_policy_net)
-
-# Print Results
-print("Policy Network Evaluation:"
-        f"\nCompletion Rate: {float_rate:.2f}% | "
-        f"\nAverage Reward: {float_reward:.4f} | "
-        f"\nAverage Steps: {float_steps:.2f}"
+    # Quantize the Model
+    quantize_(
+        quant_pnet,
+        config
     )
 
-print("Post Training Quantization Policy Network Evaluation:"
+    # Evaluate 
+    quant_reward, quant_rate, quant_steps = image_dqn.eval_model(env, quant_pnet, print_results=False)
+
+    print("Post Training Quantization Policy Network Evaluation:"
         f"\nCompletion Rate: {quant_rate:.2f}% | "
         f"\nAverage Reward: {quant_reward:.4f} | "
-        f"\nAverage Steps: {quant_steps:.2f}"
+        f"\nAverage Steps: {quant_steps:.2f}")
+
+    # Save Model
+    torch.save(quant_pnet.state_dict(), f"{config_name}_PTQ.pth")
+
+    # Compare File Sizes
+    size = os.path.getsize("dqn_trained.pth") / 1024
+    quant_size = os.path.getsize(f"{config_name}_PTQ.pth") / 1024
+
+    print(f"Size Reduction: {size/quant_size:.2f}x ({size:.2f}KB -> {quant_size:.2f}KB)")
+
+    # Compare Model Inference
+    input_tensor = torch.randn(1, 4, screen_height, screen_width)
+
+    baseline_results = benchmark_inference(
+        pnet,
+        input_tensor
     )
 
-print("Post Training Quantization (Weight Only) Policy Network Evaluation:"
-        f"\nCompletion Rate: {wo_quant_rate:.2f}% | "
-        f"\nAverage Reward: {wo_quant_reward:.4f} | "
-        f"\nAverage Steps: {wo_quant_steps:.2f}"
+    ptq_results = benchmark_inference(
+        quant_pnet,
+        input_tensor
     )
 
-# Save the Quantized Model
-torch.save(quantized_policy_net.state_dict(), "dqn_quantized.pth")
-torch.save(wo_quantized_policy_net.state_dict(), "dqn_quantized_wo.pth")
+    for name, results in [
+        ("Baseline", baseline_results),
+        (f"PTQ for {config_name}", ptq_results)
+    ]:
 
+        print(f"\n{name}")
+        print(f"Mean:       {results['mean_ms']:.4f} ms")
+        print(f"Std:        {results['std_ms']:.4f} ms")
+        print(f"Median:     {results['median_ms']:.4f} ms")
+        print(f"Min:        {results['min_ms']:.4f} ms")
+        print(f"Max:        {results['max_ms']:.4f} ms")
+        print(f"Throughput: {results['throughput']:.2f} inferences/s")
 
-# Compare File Sizes
-original_size = os.path.getsize("dqn_trained.pth") / 1024**2
-quantized_size = os.path.getsize("dqn_quantized.pth") / 1024**2
-wo_quantized_size = os.path.getsize("dqn_quantized_wo.pth") / 1024**2
+    # Speedup
+    baseline_time = baseline_results["mean_ms"]
+    ptq_time = ptq_results["mean_ms"]
 
-print(
-    f"Size Reduction: {original_size / quantized_size:.2f}x ({original_size:.2f}MB -> {quantized_size:.2f}MB)"
-)
-print(
-    f"Size Reduction (Weight Only): {original_size / wo_quantized_size:.2f}x ({original_size:.2f}MB -> {wo_quantized_size:.2f}MB)"
-)
+    print(f"\nBaseline → PTQ {config_name} Speedup: {baseline_time / ptq_time:.2f}x")
 
-# Compare Model Speed Up
-original_model = policy_net
-quantized_model = quantized_policy_net
-wo_quantized_model = wo_quantized_policy_net
+# =====================================================
+# Compare Inference
+# =====================================================
+def benchmark_inference(model, input_tensor, num_warmup=100, num_runs=1000):
 
-# Get Example Inputs
-example_inputs = torch.randn(1, 4, screen_height, screen_width)
-wo_example_inputs = torch.randn(1, 4, screen_height, screen_width)
+    model.eval()
 
-
-# Throughput: original model
-start = time.perf_counter()
-
-for _ in range(1000):
     with torch.inference_mode():
-        _ = original_model(example_inputs)
 
-original_time = time.perf_counter() - start
+        # Warm-up
+        for _ in range(num_warmup):
+            model(input_tensor)
 
+        times = []
 
-# Throughput: Quantized (W8A8-INT) model
-start = time.perf_counter()
+        for _ in range(num_runs):
+            start = time.perf_counter()
 
-for _ in range(1000):
-    with torch.inference_mode():
-        _ = quantized_model(example_inputs)
+            model(input_tensor)
 
-quantized_time = time.perf_counter() - start
+            end = time.perf_counter()
 
-print(f"Speedup: {original_time / quantized_time:.2f}x")
+            times.append((end - start) * 1000)
 
+    times = np.array(times)
 
-# Throughput: Weight Only model
-start = time.perf_counter()
+    return {
+        "mean_ms": np.mean(times),
+        "std_ms": np.std(times),
+        "min_ms": np.min(times),
+        "max_ms": np.max(times),
+        "median_ms": np.median(times),
+        "throughput": 1000 / np.mean(times)
+    }
 
-for _ in range(1000):
-    with torch.inference_mode():
-        _ = original_model(wo_example_inputs)
-
-original_time = time.perf_counter() - start
-
-
-# Throughput: Weight Only Quantized model
-start = time.perf_counter()
-
-for _ in range(1000):
-    with torch.inference_mode():
-        _ = wo_quantized_model(wo_example_inputs)
-
-wo_quantized_time = time.perf_counter() - start
-
-print(f"Speedup (Weight Only): {original_time / wo_quantized_time:.2f}x")
+# =====================================================
+# Run the Code for All Models
+# =====================================================
+if __name__ == "__main__":
+    models = {"F8WO": Float8WeightOnlyConfig(),
+              "I8DAI8W": Int8DynamicActivationInt8WeightConfig(),
+              "I8DAI4W": Int8DynamicActivationIntxWeightConfig(weight_dtype=torch.int4),
+              "I8WO": Int8WeightOnlyConfig()
+              }
+    
+    for name, config in models.items():
+        try:
+            quantize_models(policy_net, config, name)
+        except (AssertionError, RuntimeError) as e:
+            print(f"\nSkipping {name}: {e}")

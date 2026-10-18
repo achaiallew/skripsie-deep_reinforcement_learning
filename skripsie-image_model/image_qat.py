@@ -16,14 +16,15 @@ from torch import nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+# Import Numpy for Model Inference
+import numpy as np
+
 
 # Imports for Quantization Aware Training
-from torchao.quantization import quantize_, Int8DynamicActivationIntxWeightConfig
+from torchao.quantization import Int8DynamicActivationIntxWeightConfig
+from torchao.quantization import IntxWeightOnlyConfig, quantize_
 from torchao.quantization.granularity import PerAxis
 from torchao.quantization.qat import QATConfig
-
-# Imports for ExecuTorch (converting model)
-from executorch.exir import to_edge_transform_and_lower
 
 # Imports for Writing to Tensorboard
 from torch.utils.tensorboard import SummaryWriter
@@ -47,7 +48,7 @@ mem_size = 200000
 hiddenLayerSize = (128,)
 
 #============================================================================
-# Network
+# Create the Network
 #============================================================================
 class CNN_DQN_Quant(nn.Module):
 
@@ -109,211 +110,262 @@ else:
     raise FileNotFoundError(f'No saved model found at {model_trained}.')
 
 #============================================================================
-# Create QAT Policy and Target Networks
+# Quantization Aware Training
 #============================================================================
-# Create a Copy to Quantize
-qat_policy_net = copy.deepcopy(policy_net)
+def quantize_models(pnet, config, config_name):
 
-# Create a Copy for the Target Network 
-qat_target_net = copy.deepcopy(policy_net)
+    # Create a Copy for the Policy Network
+    qat_policy_net = copy.deepcopy(pnet)
+
+    # Create a Copy for the Target Network
+    qat_target_net = copy.deepcopy(pnet)
+
+    #============================================================================
+    # Configure Fake Quantization
+    #============================================================================
+    qat_prepare_config = QATConfig(
+        config,
+        step="prepare",
+    )
+
+    qat_convert_config = QATConfig(
+        config,
+        step="convert",
+    )
+
+    #============================================================================
+    # Prepare Policy and Target Networks for QAT
+    #============================================================================
+    # Fake Quantization of the Policy Network
+    quantize_(qat_policy_net, qat_prepare_config)
+
+    # Fake Quantization of the Target Network
+    quantize_(qat_target_net, qat_prepare_config)
+
+    # Set Target Network to Eval Mode to not Update Parameters
+    qat_target_net.eval()
+
+    #============================================================================
+    # Setup HyperParameters from Previously Trained Model
+    #============================================================================
+    # Best Learning Rate
+    # alpha = 0.00012488734110133683
+
+    # ---- TRAINING HYPERPARAMETERS ----
+    alpha = 0.000012488734110133683
+    gamma = 0.9191933975967473
+    batch_size = 128
+    train_param = [alpha, gamma, batch_size]
+
+    # ---- EXPLORATION HYPERPARAMETERS ----
+    start_epsilon = 0.1
+    stop_epsilon = 0.01
+    decay_rate = 10000
+    explore_param = [start_epsilon, stop_epsilon, decay_rate]
+
+    #============================================================================
+    # Configure Fake Quantization Training Parameters
+    #============================================================================
+    # Memory
+    qat_memory = ReplayMemory(mem_size)
+
+    # Episode Size
+    qat_episodes = 500
+
+    # Adam Optimiser
+    qat_optimiser = optim.Adam(qat_policy_net.parameters(), alpha)
+
+    #============================================================================
+    # Quantization Aware Training - Fine Tuning
+    #============================================================================
+    print(f'\nStart Quantization Aware Training for {config_name} (Fine-Tuning)...')
+    start_time = time.time()
+
+    # SetUp Tensorboard
+    writer = SummaryWriter(log_dir=f"runs/QAT_{config_name}")
+
+    # Train with QAT
+    qat_policy_net.train()
+    mean_reward, success_rate, mean_steps = deep_q_learning(
+        env, train_param, explore_param, qat_optimiser, qat_policy_net,
+        qat_target_net, episodes=qat_episodes, writer=writer, memory=qat_memory
+    )
+
+    # Done Training
+    print(f'Done Quantization Aware Training for {config_name} (Fine-Tuning)...')
+    end_time = time.time()
+
+    # Determine Training Time
+    elapsed = end_time - start_time
+
+    # Print Results to Screen
+    print(f'Training Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
+    print(f'Mean Steps Taken: {mean_steps}')
+    print(f'Mean Reward: {mean_reward}')
+    print(f'Success Rate: {success_rate}')
+
+    # Flush Remaining Data
+    writer.flush()
+    writer.close()
+
+    #============================================================================
+    # Convert QAT Model
+    #============================================================================
+    # Copy Model to Convert
+    qat_quantized_net = copy.deepcopy(qat_policy_net)
+    qat_quantized_net.eval()
+
+    # Move to CPU for inference quantization
+    qat_quantized_net.cpu()
+
+    # Remove the Fake-Quantization Wrappers (Convert)
+    quantize_(qat_quantized_net, qat_convert_config)
+
+    # Save the Trained Model
+    output_file = f"{config_name}_QAT.pth"
+    torch.save(qat_quantized_net.state_dict(), output_file)
+
+    #============================================================================
+    # Evaluate Final QAT Model
+    #============================================================================
+    print(f'Starting Evaluation for {config_name}...')
+    start_time = time.time()
+
+    # EVALUATION
+    qat_reward, qat_success, qat_steps = eval_model(
+        env, qat_quantized_net, eval_episodes=100, print_results=False
+    )
+
+    # Done Final Evaluation
+    end_time = time.time()
+    elapsed = end_time - start_time
+
+    # Print Results to Screen
+    print(f'Evaluation Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
+    print(f"Completion Rate: {qat_success:.2f}% | "
+          f"Average Reward: {qat_reward:.4f} | "
+          f"Average Steps: {qat_steps:.2f}")
+
+    #============================================================================
+    # Compare Model File Sizes
+    #============================================================================
+    # Compare File Sizes
+    original_size = os.path.getsize("dqn_trained.pth") / 1024
+    qat_size = os.path.getsize(output_file) / 1024
+
+    print(
+        f"Size Reduction: {original_size / qat_size:.2f}x "
+        f"({original_size:.2f}KB -> {qat_size:.2f}KB)"
+    )
+
+    #============================================================================
+    # Compare Model Inference
+    #============================================================================
+    input_tensor = torch.randn(1, 4, screen_height, screen_width)
+
+    def benchmark_inference(model, input_tensor, num_warmup=100, num_runs=1000):
+
+        model.eval()
+
+        with torch.inference_mode():
+
+            # Warm-up
+            for _ in range(num_warmup):
+                model(input_tensor)
+
+            times = []
+
+            for _ in range(num_runs):
+                start = time.perf_counter()
+
+                model(input_tensor)
+
+                end = time.perf_counter()
+
+                times.append((end - start) * 1000)
+
+        times = np.array(times)
+
+        return {
+            "mean_ms": np.mean(times),
+            "std_ms": np.std(times),
+            "min_ms": np.min(times),
+            "max_ms": np.max(times),
+            "median_ms": np.median(times),
+            "throughput": 1000 / np.mean(times)
+        }
+
+    # Both models must be on CPU for a fair comparison
+    fp32_model = copy.deepcopy(pnet).cpu()
+    fp32_model.eval()
+
+    qat_quantized_net.cpu()
+    qat_quantized_net.eval()
+
+    baseline_results = benchmark_inference(
+        fp32_model,
+        input_tensor
+    )
+
+    qat_results = benchmark_inference(
+        qat_quantized_net,
+        input_tensor
+    )
+
+    for name, results in [
+        ("Baseline", baseline_results),
+        (f"QAT for {config_name}", qat_results)
+    ]:
+
+        print(f"\n{name}")
+        print(f"Mean:       {results['mean_ms']:.4f} ms")
+        print(f"Std:        {results['std_ms']:.4f} ms")
+        print(f"Median:     {results['median_ms']:.4f} ms")
+        print(f"Min:        {results['min_ms']:.4f} ms")
+        print(f"Max:        {results['max_ms']:.4f} ms")
+        print(f"Throughput: {results['throughput']:.2f} inferences/s")
+
+    # Speedup
+    baseline_time = baseline_results["mean_ms"]
+    qat_time = qat_results["mean_ms"]
+
+    print(
+        f"\nBaseline → QAT {config_name} Speedup: "
+        f"{baseline_time / qat_time:.2f}x"
+    )
 
 #============================================================================
-# Configure Fake Quantization
+# Run the Code for All Models
 #============================================================================
-# Configure INT8 Activations and INT4 Weights
-base_config = Int8DynamicActivationIntxWeightConfig(
-    weight_dtype=torch.int4,
-    weight_granularity=PerAxis(0)
-)
+if __name__ == "__main__":
 
-# Prepare Fake Quantization
-qat_prepare_config = QATConfig(
-    base_config,
-    step="prepare",
-)
+    # Make the Gym Environment
+    env = gym.make('MiniGrid-Empty-8x8-v0')
+    env = RGBImgPartialObsWrapper(env)
+    env = ImgObsWrapper(env)
 
-# Convert Fake Quantization (after training)
-qat_convert_config = QATConfig(
-    base_config,
-    step="convert",
-)
+    models = {
+        "I8DAI8W": Int8DynamicActivationIntxWeightConfig(
+            weight_dtype=torch.int8,
+            weight_granularity=PerAxis(0),
+        ),
+        "I8DAI4W": Int8DynamicActivationIntxWeightConfig(
+            weight_dtype=torch.int4,
+            weight_granularity=PerAxis(0),
+        ),
+        "I8WO": IntxWeightOnlyConfig(
+            weight_dtype=torch.int8,
+            granularity=PerAxis(0),   # note: `granularity`, not `weight_granularity`
+        ),
+    }
 
-#============================================================================
-# Prepare Policy and Target Networks for QAT
-#============================================================================
-# Fake Quatization of the Policy Network
-quantize_(qat_policy_net, qat_prepare_config)
+    for name, config in models.items():
+        try:
+            quantize_models(policy_net, config, name)
+        except (AssertionError, RuntimeError) as e:
+            print(f"\nSkipping {name}: {e}")
 
-# Fake Quatization of the Target Network
-quantize_(qat_target_net, qat_prepare_config)
-
-# Set Target Network to Eval Mode to not Update Parameters
-qat_target_net.eval()
-
-#============================================================================
-# Setup HyperParameters from Previously Trained Model
-#============================================================================
-# Best Learning Rate
-# alpha = 0.00013655199655359068
-
-# ---- TRAINING HYPERPARAMETERS ----
-alpha = 0.000012488734110133683
-gamma = 0.9191933975967473
-batch_size = 128
-train_param = [alpha, gamma, batch_size]
-
-# ---- EXPLORATION HYPERPARAMETERS ----
-start_epsilon = 0.1
-stop_epsilon = 0.01
-decay_rate = 10000
-explore_param = [start_epsilon, stop_epsilon, decay_rate]
-
-#============================================================================
-# Configure Fake Quantization Training Parameters
-#============================================================================
-# Memory
-qat_memory = ReplayMemory(mem_size)
-
-# Episode Size
-qat_episodes = 500
-
-# Adam Optimiser
-qat_optimiser = optim.Adam(qat_policy_net.parameters(), alpha)
-
-# Make the Gym Environment
-env = gym.make('MiniGrid-Empty-8x8-v0')
-env = RGBImgPartialObsWrapper(env)
-env = ImgObsWrapper(env)
-
-# SetUp Tensorboard
-writer = SummaryWriter()
-
-#============================================================================
-# Quantization Aware Training - Fine Tuning
-#============================================================================
-# Start QAT
-print('Start Quantization Aware Training (Fine-Tuning)...')
-start_time = time.time()
-
-# Train with QAT
-qat_policy_net.train()
-mean_reward, success_rate, mean_steps = deep_q_learning(env, train_param, explore_param, qat_optimiser, qat_policy_net, 
-                                                        qat_target_net, episodes=qat_episodes, writer=writer, memory=qat_memory)
-
-# Done Training
-print('Done Quantization Aware Training (Fine-Tuning)...')
-end_time = time.time()
-
-# Determine Training Time
-elapsed = end_time - start_time
-
-# Print Results to Screen
-print(f'Training Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
-print(f'Mean Steps Taken: {mean_steps}')
-print(f'Mean Reward: {mean_reward}')
-print(f'Success Rate: {success_rate}')
-
-# Flush Remaining Data
-writer.flush()
-writer.close()
-
-#============================================================================
-# Convert QAT Model
-#============================================================================
-# Copy Model to Convert
-qat_quantized_net = copy.deepcopy(qat_policy_net)
-qat_quantized_net.eval()
-# Move to CPU for inference quantization
-qat_quantized_net.cpu()
-
-# Remove the Fake-Quantization Wrappers (Convert)
-quantize_(qat_quantized_net, qat_convert_config)
-
-# Save the Trained Model
-torch.save(qat_quantized_net.state_dict(), "dqn_qat_quantized.pth")
-
-#============================================================================
-# Evaluate Final QAT Model
-#============================================================================
-# Evaluate Converted Model Performance
-print('Starting Evaluation...')
-start_time = time.time()
-
-# EVALUATION
-qat_reward, qat_success, qat_steps = eval_model(env, qat_quantized_net, eval_episodes=100, print_results=False)
-
-
-# Done Final Evaluation
-end_time = time.time()
-elapsed = end_time - start_time
-
-# Print Results to Screen
-print(f'Evaluation Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
-print(f'Evaluation Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
-print(f"Completion Rate: {qat_success:.2f}% | "
-        f"Average Reward: {qat_reward:.4f} | "
-        f"Average Steps: {qat_steps:.2f}"
-)
-
-#============================================================================
-# Compare Model File Sizes
-#============================================================================
-# Compare File Sizes
-original_size = os.path.getsize("dqn_trained.pth") / 1024**2
-qat_size = os.path.getsize("dqn_qat_quantized.pth") / 1024**2
-
-print(
-    f"Size Reduction (Quantized): {original_size / qat_size:.2f}x ({original_size:.2f}MB -> {qat_size:.2f}MB)"
-)
-
-#============================================================================
-# Compare Pure Model Inference Speed
-#============================================================================# Both models must be on CPU for a fair comparison
-fp32_model = copy.deepcopy(policy_net).cpu()
-fp32_model.eval()
-
-example_input = torch.randn(1, 4, screen_height, screen_width)
-
-# Warm-up
-with torch.inference_mode():
-    for _ in range(100):
-        fp32_model(example_input)
-        qat_quantized_net(example_input)
-
-# Time FP32 model
-start_time = time.perf_counter()
-
-with torch.inference_mode():
-    for _ in range(10000):
-        fp32_model(example_input)
-
-fp32_time = time.perf_counter() - start_time
-
-# Time quantized QAT model
-start_time = time.perf_counter()
-
-with torch.inference_mode():
-    for _ in range(10000):
-        qat_quantized_net(example_input)
-
-quantized_time = time.perf_counter() - start_time
-
-print("\nInference Speed Comparison:")
-
-print(f"FP32 time: {fp32_time:.4f} s")
-
-print(
-    f"INT4 QAT time: "
-    f"{quantized_time:.4f} s"
-)
-
-print(
-    f"Speed-up: "
-    f"{fp32_time / quantized_time:.2f}x"
-)
-
-
-#============================================================================
-# Close Environment
-#============================================================================
-env.close()
+    #============================================================================
+    # Close Environment
+    #============================================================================
+    env.close()

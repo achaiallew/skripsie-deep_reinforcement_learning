@@ -365,7 +365,7 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
                 next_state, stacked_frames = stack_frames(stacked_frames, next_obs, False)
 
             # Store Transition in Experience Replay Memory
-            memory.push(current_state, action, next_state, reward )
+            memory.push(current_state, action, next_state, reward)
 
             # Train Model
             if steps_done % 4 == 0:
@@ -392,9 +392,7 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
 
         # Epsiode Rewards
         episode_rewards.append(episode_reward)
-        episode_avg_steps.append(episode_steps) 
-
-
+        episode_avg_steps.append(episode_steps)
 
         # Write to Tensorboard upon Completion
         if writer is not None:
