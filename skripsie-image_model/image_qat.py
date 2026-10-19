@@ -31,6 +31,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 #Imports from DQN 
 from image_dqn import (ReplayMemory, deep_q_learning, eval_model, device)
+import image_dqn
 
 #============================================================================
 # Settings
@@ -113,6 +114,9 @@ else:
 # Quantization Aware Training
 #============================================================================
 def quantize_models(pnet, config, config_name):
+
+    # Reset Steps Done
+    image_dqn.steps_done = 0
 
     # Create a Copy for the Policy Network
     qat_policy_net = copy.deepcopy(pnet)

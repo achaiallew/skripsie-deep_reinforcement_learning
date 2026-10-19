@@ -3,7 +3,7 @@
 #include <math.h>
 #include <float.h>
 #include "pico/stdlib.h"
-#include "model_weights.h"
+#include "I8DAI8W_QAT_weights.h"
 
 #define state_size (4 * 56 * 56)
 

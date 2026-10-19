@@ -23,6 +23,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+# Imports for Writing toTensorboard
+from torch.utils.tensorboard import SummaryWriter
+
 # Check for GPU Availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -112,11 +115,11 @@ def get_action(state):
 #============================================================================
 # Evaluate Agent Performance
 #============================================================================
-def eval_model(env, eval_episodes=100, print_results=True):
+def eval_model(env, eval_episodes=100, print_results=True, writer=None):
     # Set Up Eval Counter Variables
     eval_success = 0.0
     total_steps = 0.0
-    total_reward = 0.0
+    total_reward = 0.0 
 
     # Episode Loop
     with torch.no_grad():
@@ -164,12 +167,16 @@ def eval_model(env, eval_episodes=100, print_results=True):
                 current_obs = next_obs.copy()
                 current_state = next_state
 
+                # Write to Tensorboard upon Completion
+                if writer is not None:
+                    writer.add_scalar('Reward/train', reward, e)
+                    writer.add_scalar('Steps/train', env.unwrapped.step_count, e)
+
     success_rate = 100 * eval_success / eval_episodes
     mean_reward = total_reward / eval_episodes
     mean_steps = total_steps / eval_episodes
 
     return mean_reward, success_rate, mean_steps
-
 
 #============================================================================
 # Run the Study
@@ -180,10 +187,13 @@ if __name__ == "__main__":
     env = RGBImgPartialObsWrapper(env)
     env = ImgObsWrapper(env)
 
+    # SetUp Tensorboard
+    writer = SummaryWriter(log_dir=f"runs/QAT_Device")
+
     # Evaluate Model Performance
     print('Starting Evaluation...')
     start_time = time.time()
-    mean_reward, success_rate, mean_steps = eval_model(env, eval_episodes=100, print_results=True)
+    mean_reward, success_rate, mean_steps = eval_model(env, eval_episodes=100, print_results=True, writer=writer)
 
     # Done Final Evaluation
     end_time = time.time()
@@ -193,6 +203,10 @@ if __name__ == "__main__":
           f"Average Reward: {mean_reward:.4f} | "
           f"Average Steps: {mean_steps:.2f}"
     )
+
+    # Flush Remaining Data
+    writer.flush()
+    writer.close()
 
     # Close the Environment
     env.close()

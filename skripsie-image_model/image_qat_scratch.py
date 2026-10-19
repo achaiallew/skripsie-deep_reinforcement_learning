@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 #Imports from DQN 
 from image_dqn import (ReplayMemory, deep_q_learning, eval_model, device)
+import image_dqn
 
 #============================================================================
 # Settings
@@ -557,6 +558,9 @@ class IntegerDQN(nn.Module):
 # Quantization Aware Training
 #============================================================================
 def quantize_models(pnet, weight_bits, act_bits, config_name):
+
+    # Reset Steps Done
+    image_dqn.steps_done = 0
 
     # Build the QAT Policy Network From the Trained Network
     qat_policy_net = CNN_DQN_QAT(pnet, weight_bits, act_bits, act_momentum).to(device)

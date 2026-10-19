@@ -396,8 +396,8 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
 
         # Write to Tensorboard upon Completion
         if writer is not None:
-            writer.add_scalar('Reward/train', reward, steps_done)
-            writer.add_scalar('Steps/train', s, steps_done)
+            writer.add_scalar('Reward/train', episode_reward.item(), e)
+            writer.add_scalar('Steps/train', episode_steps, e)
 
     return np.mean(episode_rewards), success_rate/episodes*100, np.mean(episode_avg_steps) 
 
