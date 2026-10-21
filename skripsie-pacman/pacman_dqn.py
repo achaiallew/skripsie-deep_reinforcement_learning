@@ -31,58 +31,70 @@ import torch.nn.functional as F
 # Imports for Writing toTensorboard
 from torch.utils.tensorboard import SummaryWriter
 
-# Check for GPU Availability
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
+# Use CPU
+device = torch.device("cpu")
+
+#============================================================================
+# Configuration
+#============================================================================
+# ---- MODEL HYPERPARAMETERS ----
+num_actions = 5                     # noop, up, right, left, down
+steps_done = 0
+max_steps = 10000
+
+# ---- MEMORY HYPERPARAMETERS ----
+target_update = 10000               # no. steps bet. updating target network
+mem_size = 200000                   # no. experiences the memory can keep\
+start_learn = 10000                 # no. experience to collect before train 
+
+# ---- MODEL HYPERPARAMETERS ----
+eval_epsilon = 0.05                 # eval room to explore     
+tune_episodes = 200                 # optuna trial episodes
+final_episodes = 3000               # final training episodes
+
+filename = 'pacman_trained.pth'
 
 #============================================================================
 # Preprocess Functions
 #============================================================================
 class AtariPreprocessor:
-    """Preprocess Atari frames: grayscale, resize, frame stacking."""
+    """Preprocess Atari Frames: grayscale, resize, frame stacking."""
     
     def __init__(self, stack_size=4):
         self.stack_size = stack_size
         self.frames = deque(maxlen=stack_size)
     
-    def preprocess_frame(self, frame):
-        """Convert RGB frame to 84x84 grayscale."""
-        import cv2
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
-        return resized.astype(np.float32) / 255.0
     
     def reset(self, frame):
         """Reset frame stack with initial observation."""
-        processed = self.preprocess_frame(frame)
         for _ in range(self.stack_size):
-            self.frames.append(processed)
+            self.frames.append(frame)
         return self.get_state()
     
     def step(self, frame):
         """Add new frame to stack."""
-        processed = self.preprocess_frame(frame)
-        self.frames.append(processed)
+        self.frames.append(frame)
         return self.get_state()
     
     def get_state(self):
-        """Return stacked frames as (4, 84, 84) array."""
+        """Return stacked frames as (4, 84, 84) uint8 array."""
         return np.array(self.frames)
 
-#============================================================================
-# SetUp the HyperParameters
-#============================================================================
-# ---- MODEL HYPERPARAMETERS ----
-num_actions = 5                  # noop, up, right, left, down
-steps_done = 0
-max_steps = 10000
+# Make the Pacman Environment
+def make_env(seed=None, render_mode=None):
+    env = gym.make('MsPacmanNoFrameskip-v4', render_mode=render_mode)
+    
+    """The NoFrameskip env acted at 60 Hz, so 4 stacked frames hardly showed any motion. 
+    Skip 4 frames per action"""
+    env = gym.wrappers.AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=84,
+                                          grayscale_obs=True, scale_obs=False)
 
-# ---- MEMORY HYPERPARAMETERS ----
-target_update = 10000              # no. steps bet. updating target network
-mem_size = 200000                  # no. experiences the memory can keep
+    # Seed the Environment for Reproducible Comparisons
+    if seed is not None:
+        env.reset(seed=seed)
+        env.action_space.seed(seed)
 
-# ---- TESTING HYPERPARAMETERS ----
-filename = 'pacman_trained.pth'
+    return env
 
 #============================================================================
 # Define and Create Convulutional Neural Network Model - RGB Images
@@ -110,6 +122,7 @@ class Atari_DQN(nn.Module):
         )
     
     def forward(self, x):
+        x = x.float()/ 255.0                # unit8 (0-255)
         conv_features = self.conv(x)
         flat = conv_features.view(x.size(0), -1)
         return self.fc(flat)
@@ -127,6 +140,10 @@ def select_action(state, frame_idx, explore_param, policy_net, writer, greedy=Fa
 
     # Act Greedily Toward Q-Values of Policy Network
     if greedy:
+        # Small Chance of Random Action during Evaluation
+        if random.random() < eval_epsilon:
+            return torch.tensor([[random.randrange(num_actions)]], device=device, dtype=torch.long)
+        
         with torch.no_grad():
             q_values = policy_net(state)
             action = q_values.max(1)[1].unsqueeze(0)
@@ -150,9 +167,6 @@ def select_action(state, frame_idx, explore_param, policy_net, writer, greedy=Fa
     if r > epsilon_thres:
         # Act Greedily Toward Q-Values of Policy Network given State
         with torch.no_grad():
-            '''t.max(1) will return largest column value of each row.
-            second column on max result is index of where max element was
-            found, so we pick action with larger expected reward.'''
             return policy_net(state).max(1)[1].unsqueeze(0)
     else:
         # Select Random Action with Equal Probability
@@ -163,49 +177,49 @@ def select_action(state, frame_idx, explore_param, policy_net, writer, greedy=Fa
 #============================================================================
 Transition = namedtuple('Transition', ('currentState', 'action', 'nextState', 'reward'))
 
-class EfficientReplayBuffer:
-    """Memory-efficient replay buffer for image observations."""
-    
+class ReplayBuffer:
+
+    # Memory Replay Buffer for Image Observations 
     def __init__(self, capacity=100000, state_shape=(4, 84, 84)):
         self.capacity = capacity
         self.state_shape = state_shape
         self.states = np.zeros((capacity, *state_shape), dtype=np.uint8)
+        self.next_frames = np.zeros((capacity, *state_shape[1:]), dtype=np.uint8)
         self.actions = np.zeros(capacity, dtype=np.int64)
         self.rewards = np.zeros(capacity, dtype=np.float32)
-        self.next_states = np.zeros((capacity, *state_shape), dtype=np.uint8)
         self.dones = np.zeros(capacity, dtype=np.float32)
         self.idx = 0
         self.size = 0
     
     def push(self, state, action, reward, next_state, done):
-        self.states[self.idx] = (state * 255).astype(np.uint8)
+        self.states[self.idx] = state
         self.actions[self.idx] = action
         self.rewards[self.idx] = reward
-
-        if next_state is not None:
-            self.next_states[self.idx] = (next_state * 255).astype(np.uint8)
-        else:
-            self.next_states[self.idx] = np.zeros(self.state_shape, dtype=np.uint8)
-
+        self.next_frames[self.idx] = next_state[-1]
         self.dones[self.idx] = float(done)
         self.idx = (self.idx + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
+
     
     def sample(self, batch_size=32):
-        indices = np.random.choice(self.size, batch_size, replace=False)
+        indices = np.random.randint(0, self.size, batch_size)
+        state_batch = self.states[indices]
+        # Rebuild Next State: Drop Oldest Frame, Append Newest Frame
+        next_state_batch = np.concatenate([state_batch[:, 1:], self.next_frames[indices][:, None]], axis=1)
         return (
-            torch.FloatTensor(self.states[indices]) / 255.0,
+            torch.from_numpy(state_batch).float(),
             torch.LongTensor(self.actions[indices]),
             torch.FloatTensor(self.rewards[indices]),
-            torch.FloatTensor(self.next_states[indices]) / 255.0,
+            torch.from_numpy(next_state_batch).float(),
             torch.FloatTensor(self.dones[indices])
         )
+
     
     def __len__(self):
         return self.size
 
 # Initalise Experience Replay Memory
-memory = EfficientReplayBuffer(mem_size)
+memory = ReplayBuffer(mem_size)
 
 #============================================================================
 # Optimise Model
@@ -221,41 +235,43 @@ def optimise_model(train_param, writer, optimiser, policy_net, target_net, memor
     if len(memory) < batch_size:
         return
 
-    # ---- SAMPLE MINI-BATCH ----
+    # Sample Mini-Batch
     experience = memory.sample(batch_size)
 
-    # ---- CALC ACTION-VALUE PREDICTED BY POLICY NETWORK ----
+    # Calculate Action-Value Predicted by Policy Network
     state_batch, action_batch, reward_batch, next_state_batch, done_batch = experience
     action_batch = action_batch.unsqueeze(1)
 
-    '''Calculate the Action-Values for each State in Batch,
-        and then gather the Q-Values for Action Associated with Specific State'''
+    # Calculate the Action-Values for each State in Batch
     state_action_values = policy_net(state_batch).gather(1, action_batch)
 
-    # ---- CALC TD-TARGET ESTIMATED BY TARGET NETWORK ----
+    # Calculate TD-Target Estimated by Target Network
     nf_next_states = next_state_batch.to(device)
     next_state_values = torch.zeros(batch_size, device=device)
     nf_mask = ~done_batch.bool()
 
     with torch.no_grad():
-        # ---- DOUBLE DQN ----
-        # Use POLICY network to select the best next action
-        best_next_actions = policy_net(nf_next_states[nf_mask]).max(1)[1].unsqueeze(1)
+        if nf_mask.any():
+            # ---- DOUBLE DQN ----
+            # Policy Network Selects Best Next Action
+            best_next_actions = policy_net(nf_next_states[nf_mask]).max(1)[1].unsqueeze(1)
+ 
+            # Target Network Evaluates Action's Q-value
+            next_state_values[nf_mask] = target_net(nf_next_states[nf_mask]).gather(1, best_next_actions).squeeze(1)
 
-        # Use TARGET network only to evaluate that action's Q-value
-        next_state_values[nf_mask] = target_net(nf_next_states[nf_mask]).gather(1, best_next_actions).squeeze(1)
 
     # Compute the Expected Q-Values (TD-Target)
     TDtargets = (next_state_values * gamma) + reward_batch
 
-    # ---- CALC LOSS using MINIMUM-SQUARED-ERROR CRITERION ----
-    criterion = nn.MSELoss()
+    # Calculate Loss using Huber Criterion
+    criterion = nn.SmoothL1Loss()
     loss = criterion(state_action_values, TDtargets.unsqueeze(1))
 
-    # TD-error: how far off the policy network's estimate was from the target
+
+    # TD-Error: Target vs Predicted
     TDerrors = TDtargets.unsqueeze(1) - state_action_values
 
-    # ---- MAKE GRADIENT DESCENT STEP TO MINIMISE LOSS ----
+    # Gradient Descent Step to Minimise Loss
     optimiser.zero_grad()
     loss.backward()
 
@@ -263,6 +279,7 @@ def optimise_model(train_param, writer, optimiser, policy_net, target_net, memor
     for param in policy_net.parameters():
         param.grad.data.clamp_(-1, 1)
 
+    # Take a Step
     optimiser.step()
 
     # Log Loss to Tensorboard
@@ -281,8 +298,6 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
     global steps_done
     episode_rewards = []
     episode_avg_steps = []
-    success_rate = 0
-    total_frames=1000000
 
     # Episode Loop
     for e in range(episodes):
@@ -295,34 +310,31 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
         preprocessor = AtariPreprocessor()
         current_state = preprocessor.reset(current_obs)
 
-        for frame_idx in range(0, total_frames + 1):
+        for _ in range(max_steps):
             # Perform Epsilon-Greedy Action Selection
-            action = select_action(current_state, frame_idx, explore_param, policy_net, writer, greedy=False)
+            action = select_action(current_state, steps_done, explore_param, policy_net, writer, greedy=False)
             a = action.item()
 
             # Perform the Action in Environment
             next_obs, reward, done, truncated, _ = env.step(a)
 
-            reward = torch.tensor([reward], device=device)
-
             # Increment Step Counters
             episode_steps += 1
             steps_done += 1
-            # Calculate Accumulated Rewards
+
+            # Calculate Accumulated Rewards (Raw Game Score)
             episode_reward += reward
 
             # Preprocess the Observation to Obtain Next State
-            if done or truncated:
-                next_state = None
-            else:
-                next_state = preprocessor.step(next_obs)
+            next_state = preprocessor.step(next_obs)
 
             # Store Transition in Experience Replay Memory
-            memory.push(current_state, action, reward, next_state, done or truncated)
+            memory.push(current_state, a, np.sign(reward), next_state, done)        # reward clipped to -1, 0, +1 (standard for Atari)
 
-            # Train Model
-            if steps_done % 4 == 0:
+            # Train Model (wait for experience)
+            if steps_done >= start_learn and steps_done % 4 == 0:
                 optimise_model(train_param, writer, optimiser, policy_net, target_net, memory)
+
 
             # Move to Next State
             current_state = next_state
@@ -332,21 +344,17 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
                 print(f'Updating target network at step {steps_done}')
                 target_net.load_state_dict(policy_net.state_dict())
 
-            # Increment the Successful Episodes
-            if done: success_rate += 1
-
             # End Loop if Terminated or Truncated
             if done or truncated:
                 break
 
         # Periodically Track Episode and Step Progress
-        #if e % 100 == 0:
-            #print(f'Episode {e}/{episodes} | Steps Done: {steps_done}')
+        if e % 500 == 0:
+            print(f'Episode {e}/{episodes} | Steps Done: {steps_done}')
 
         # Epsiode Rewards
         episode_rewards.append(episode_reward)
         episode_avg_steps.append(episode_steps) 
-
 
 
         # Write to Tensorboard upon Completion
@@ -354,7 +362,7 @@ def deep_q_learning(env, train_param, explore_param, optimiser, policy_net, targ
             writer.add_scalar('Reward/train', episode_reward, steps_done)
             writer.add_scalar('Steps/train', episode_steps, steps_done)
 
-    return np.mean(episode_rewards[-20:]), success_rate/episodes*100, np.mean(episode_avg_steps) 
+    return np.mean(episode_rewards[-20:]), np.mean(episode_avg_steps) 
 
 #============================================================================
 # Evaluate Agent Performance
@@ -372,8 +380,7 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
     total_rounds = 0
     winning_episodes = 0
 
-    # CHANGED: Remember the previous mode so evaluation does not leave a training
-    # policy network in evaluation mode during Optuna.
+    # Check if Policy Network was Trained
     was_training = eval_policy_net.training
 
     # Set Policy to Evaluation Mode
@@ -397,7 +404,7 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
             # Main RL Loop
             for i in range(0, max_steps):
                 # Select an Action
-                action = select_action(current_state, 0, _, eval_policy_net, writer= None, greedy=True)
+                action = select_action(current_state, 0, None, eval_policy_net, writer= None, greedy=True)
                 a = action.item()
 
                 # Take Action
@@ -418,13 +425,10 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
                 previous_dots_eaten = dots_eaten
 
                 # Observe a New State
-                if done or truncated:
-                    next_state = None
-                else:
-                    next_state = preprocessor.step(next_obs)
+                next_state = preprocessor.step(next_obs)
 
                 # Calculate Reward
-                if done or truncated:
+                if done or truncated or i == max_steps - 1:
                     total_reward += episode_reward
                     total_steps += episode_steps
 
@@ -432,6 +436,7 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
                     if episode_rounds > 0:
                         winning_episodes += 1
 
+                    # Count Total Rounds
                     total_rounds += episode_rounds
 
                     # Display Results
@@ -444,7 +449,6 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
                     break
 
                 # Move to the Next State
-                current_obs = next_obs.copy()
                 current_state = next_state
 
     win_rate = 100 * winning_episodes / eval_episodes
@@ -452,7 +456,7 @@ def eval_model(env, eval_policy_net, eval_episodes=100, print_results=True):
     mean_rounds = total_rounds / eval_episodes
     mean_steps = total_steps / eval_episodes
 
-    # CHANGED: Restore the policy network to the mode it used before evaluation.
+    # Restore the Policy Network to State before Evaluation
     eval_policy_net.train(was_training)
 
     return mean_reward, win_rate, mean_rounds, mean_steps
@@ -473,8 +477,7 @@ def objective(trial):
     train_param = [alpha, gamma, batch_size]
     explore_param = [start_epsilon, stop_epsilon, epsilon_frames]
 
-    # CHANGED: Store every seed's evaluation results so the displayed values
-    # and Optuna score represent all seeds rather than only the final seed.
+    # Store Seed Evaluation Results
     seed_rewards = []
     seed_win_rates = []
     seed_rounds = []
@@ -491,15 +494,14 @@ def objective(trial):
 
         np.random.seed(seed)
         random.seed(seed)
-        # CHANGED: Seed PyTorch as well so each trial uses the same three
-        # reproducible network initialisations.
+
+        # Set Reproducible Seed with PyTorch
         torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
 
-        memory = EfficientReplayBuffer(mem_size)
+        # Initialise Memory
+        memory = ReplayBuffer(mem_size)
 
-        # ---- RESET FRESH NETWORKS PER SEED ----
+        #--------RESET FRESH NETWORKS PER SEED--------
         # Instantiate the Policy Network and Target Network
         policy_net = Atari_DQN(num_actions).to(device)
         target_net = Atari_DQN(num_actions).to(device)
@@ -511,43 +513,46 @@ def objective(trial):
         optimiser = optim.Adam(policy_net.parameters(), lr=alpha)
 
         # Make the Gym Environment
-        env = gym.make('MsPacmanNoFrameskip-v4')
-
-        # CHANGED: Seed the environment for reproducible comparisons between trials.
-        env.reset(seed=seed)
+        env = make_env(seed=seed)
 
         # Search the Algorithm
-        _,_,_ = deep_q_learning(env, train_param, explore_param, optimiser, policy_net, 
-                                        target_net, episodes=200, writer=None, memory=memory) 
+        _,_ = deep_q_learning(env, train_param, explore_param, optimiser, policy_net, 
+                              target_net, episodes=tune_episodes, writer=None, memory=memory) 
+        
         # Evaluate Policy
         mean_reward, win_rate, mean_rounds, mean_steps = eval_model(env, policy_net, eval_episodes=10, print_results=False) 
+
+        # Close the Environment
+        env.close()
         
-        # CHANGED: Save the results from this seed for aggregate reporting.
+        # Save Seed Results
         seed_rewards.append(mean_reward)
         seed_win_rates.append(win_rate)
         seed_rounds.append(mean_rounds)
         seed_steps.append(mean_steps)
 
-        # CHANGED: Weight reward by success rate so trials that work reliably
-        # across all seeds rank above trials that only work for one or two seeds.
+        # Score on Mean Game Reward
         partial_score = np.mean(seed_win_rates)
 
+        # Report the Trial
         trial.report(partial_score, seed)
         if trial.should_prune():
             raise optuna.TrialPruned()
-        env.close()
 
-    # CHANGED: Calculate aggregate trial results across all three seeds.
+    # Calculate Aggregate Trial Results across Seeds
     overall_mean_reward = np.mean(seed_rewards)
     overall_win_rate = np.mean(seed_win_rates)
     overall_mean_rounds = np.mean(seed_rounds)
     overall_mean_steps = np.mean(seed_steps)
 
-    trial_score = overall_win_rate
+    # Score the Trail
+    trial_score = overall_mean_reward
 
+    # Display End Tuning Time
     elapsed = time.time() - start_time
     print(f'Trial Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
-    # CHANGED: Print each seed and the aggregates instead of only the last seed.
+
+    # Print each Seed Results
     print(f'Seed Rewards: {seed_rewards}')
     print(f'Seed Win Rates: {seed_win_rates}')
     print(f'Seed Mean Rounds: {seed_rounds}')
@@ -557,109 +562,8 @@ def objective(trial):
     print(f'Overall Mean Reward: {overall_mean_reward:.4f}')
     print(f'Optuna Trial Score: {trial_score:.4f}')
 
-    # CHANGED: Return the success-weighted reward used to rank Optuna trials.
+    # Return Mean Reward to Rank Optuna Trials.
     return trial_score
-
-#============================================================================
-# Validate Best Hyperparameters Using Unseen Seeds
-#============================================================================
-def validate_hyperparameters(best_params, seeds=range(3, 8),
-                             training_episodes=500,
-                             evaluation_episodes=20):
-
-    global steps_done
-
-    validation_rewards = []
-    validation_success_rates = []
-    validation_steps = []
-
-    train_param = [
-        best_params["alpha"],
-        best_params["gamma"],
-        best_params["batch_size"]
-    ]
-
-    # Use the unscaled decay rate because validation uses the same number
-    # of training episodes as the Optuna trials.
-    explore_param = [
-        1.0,
-        best_params["stop_epsilon"],
-        best_params["epsilon_frames"]
-    ]
-
-    print("Validating best parameters on unseen seeds...")
-
-    for seed in seeds:
-        # Seed all random-number generators
-        np.random.seed(seed)
-        random.seed(seed)
-        torch.manual_seed(seed)
-
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-        steps_done = 0
-
-        # Create Fresh Replay Memory
-        validation_memory = EfficientReplayBuffer(mem_size)
-
-        # Create Fresh Networks
-        validation_policy_net = Atari_DQN(num_actions).to(device)
-        validation_target_net = Atari_DQN(num_actions).to(device)
-
-        validation_target_net.load_state_dict(validation_policy_net.state_dict())
-        validation_target_net.eval()
-
-        # Create a fresh optimiser
-        validation_optimiser = optim.Adam(
-            validation_policy_net.parameters(),
-            lr=best_params["alpha"]
-        )
-
-        # Direction must remain in the observation
-        validation_env = gym.make('MsPacmanNoFrameskip-v4')
-
-        validation_env.reset(seed=seed)
-
-        # Train from scratch
-        deep_q_learning(
-            validation_env,
-            train_param,
-            explore_param,
-            validation_optimiser,
-            validation_policy_net,
-            validation_target_net,
-            episodes=training_episodes,
-            writer=None,
-            memory=validation_memory
-        )
-
-        # Evaluate the trained policy
-        mean_reward, success_rate, mean_steps = eval_model(
-            validation_env,
-            validation_policy_net,
-            eval_episodes=evaluation_episodes,
-            print_results=False
-        )
-
-        validation_rewards.append(mean_reward)
-        validation_success_rates.append(success_rate)
-        validation_steps.append(mean_steps)
-
-        validation_env.close()
-
-    overall_reward = np.mean(validation_rewards)
-    overall_success_rate = np.mean(validation_success_rates)
-    overall_steps = np.mean(validation_steps)
-
-    print(f"Validation Rewards: {validation_rewards}")
-    print(f"Validation Success Rates: {validation_success_rates}")
-    print(f"Validation Mean Steps: {validation_steps}")
-    print(f"Overall Validation Reward: {overall_reward:.4f}")
-    print(f"Overall Validation Success Rate: {overall_success_rate:.2f}%")
-    print(f"Overall Validation Steps: {overall_steps:.2f}")
-
-    return overall_reward, overall_success_rate, overall_steps
 
 
 #============================================================================
@@ -670,7 +574,7 @@ if __name__ == "__main__":
     # Study the Model
     print("Start Hyperparameter Tuning...")
     study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
-    # CHANGED: Increase the Optuna study to 10 trials.
+    # Optuna Study to 10 trials.
     study.optimize(objective, n_trials= 10)
     
     # Display the Best Parameters
@@ -683,20 +587,12 @@ if __name__ == "__main__":
     # Log Best Parameters
     train_param = [best["alpha"], best["gamma"], best["batch_size"]]
 
-    validation_reward, validation_success, validation_steps = (
-        validate_hyperparameters(
-            best_params=best,
-            seeds=range(3, 8),
-            training_episodes=500,
-            evaluation_episodes=20
-        )
-    )
-
-    # final-training episodes, while keeping start epsilon fixed at 1.0.
-    epsilon_frames = best["epsilon_frames"] * (3000 / 100)
+    # Final Training Parameters
+    epsilon_frames = best["epsilon_frames"] * (final_episodes / tune_episodes)
     explore_param = [1.0, best["stop_epsilon"], epsilon_frames]
 
-    # ---- RESET NETWORKS FOR FINAL TRAINING ----
+
+    #--------RESET NETWORKS FOR FINAL TRAINING--------
     # Instantiate the Policy Network and Target Network
     policy_net = Atari_DQN(num_actions).to(device)
     target_net = Atari_DQN(num_actions).to(device)
@@ -707,40 +603,47 @@ if __name__ == "__main__":
     # Adam Optimiser
     optimiser = optim.Adam(policy_net.parameters(), lr=best["alpha"])
 
-    # Gym Environment
-    env = gym.make('MsPacmanNoFrameskip-v4', render_mode="rgb_array")
+    # Set Gym Environment for Recording
+    env = make_env(seed=123, render_mode="rgb_array")
     env = gym.wrappers.RecordVideo(env, episode_trigger=lambda num: num % 500 == 0,
-                                   video_folder="saved-video-folder",
-                                   name_prefix="video-",)
+                                    video_folder="saved-video-folder",
+                                    name_prefix="video-",)
+
+    
         
     # SetUp Tensorboard
     writer = SummaryWriter()
 
-    memory = EfficientReplayBuffer(mem_size)
+    # Initialise Memory
+    memory = ReplayBuffer(mem_size)
 
-    # Start Training
+    # Start Training Time
     print('Start training...')
     start_time = time.time()
 
+    # Reset Steps Done
     steps_done = 0
 
     # Train the Model
-    mean_reward, success_rate, mean_steps = deep_q_learning(env, train_param, explore_param, optimiser, policy_net, 
-                                     target_net, episodes=3000, writer=writer, memory=memory)
+    mean_reward, mean_steps = deep_q_learning(env, train_param, explore_param, optimiser, policy_net, 
+                                              target_net, episodes=3000, writer=writer, memory=memory)
 
-    # Done Training
+    # Done Training Time
     print('Done Training...')
     end_time = time.time()
     elapsed = end_time - start_time
+
+    # Print Training Results
     print(f'Training Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
     print(f'Mean Steps Taken: {mean_steps}')
     print(f'Mean Reward: {mean_reward}')
-    print(f'Success Rate: {success_rate}')
 
     
     # Flush Remaining Data
     writer.flush()
     writer.close()
+    # Close the Environment
+    env.close()
 
     # Save the Trained Model
     torch.save(policy_net.state_dict(), filename)
@@ -753,15 +656,21 @@ if __name__ == "__main__":
     else:
         raise FileNotFoundError(f'No saved model found at {filename}.')
 
-    # Evaluate Model Performance
+    # Start Model Evaluation Time
     print('Starting Evaluation...')
     start_time = time.time()
     final_policy_net.eval()
-    mean_reward, success_rate, mean_steps = eval_model(env, final_policy_net, eval_episodes=500, print_results=False)
 
-    # Done Final Evaluation
+    # Evaluate Model Performance
+    eval_env = make_env(seed=1999)
+    mean_reward, success_rate, mean_steps = eval_model(eval_env, final_policy_net, 
+                                                       eval_episodes=500, print_results=False)
+
+    # End Evaluation Time
     end_time = time.time()
     elapsed = end_time - start_time
+
+    # Display Evaluation Results
     print(f'Evaluation Done In {elapsed:.2f} s ({elapsed/60:.2f} min)')
     print(f"Completion Rate: {success_rate:.2f}% | "
           f"Average Reward: {mean_reward:.4f} | "
@@ -770,6 +679,3 @@ if __name__ == "__main__":
     
     # Close the Environment
     env.close()
-
-
-
